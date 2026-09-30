@@ -1,0 +1,39 @@
+services:
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  mock-model:
+    build: ./mock-model
+    ports:
+      - "8001:8001"
+
+  gateway:
+    build: ./gateway
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./worker
+    # No restart policy on purpose: a crashed worker must stay down so the loss is visible.
+    # init: Python must not be PID 1, because the kernel ignores a SIGKILL that
+    # PID 1 sends itself, which would silently disable CRASH_AFTER_POP.
+    init: true
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MODEL_URL: http://mock-model:8001
+      CRASH_AFTER_POP: ${CRASH_AFTER_POP:-0}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-model:
+        condition: service_started

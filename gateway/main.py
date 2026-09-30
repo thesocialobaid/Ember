@@ -12,14 +12,21 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 QUEUE_KEY = "inference_queue"
 STATUS_TTL_SECONDS = 3600
 
-r = redis.from_url(REDIS_URL, decode_responses=True)
+r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1, socket_connect_timeout=1)
 app = FastAPI()
 
 
+@app.exception_handler(redis.ConnectionError)
+@app.exception_handler(redis.TimeoutError)
+async def redis_unavailable(request, exc):
+    return JSONResponse(status_code=503, content={"detail": "redis unavailable"})
+
+
 class GenerateRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=8000)
+    # pattern r"\S": must contain at least one non-whitespace character
+    prompt: str = Field(min_length=1, max_length=8000, pattern=r"\S")
     max_tokens: int = Field(default=32, ge=1, le=1024)
-    model: str
+    model: str = Field(pattern=r"\S")
 
 
 @app.post("/v1/generate", status_code=202)
@@ -32,8 +39,13 @@ async def generate(req: GenerateRequest):
         "model": req.model,
         "enqueued_at": time.time(),
     }
-    await r.set(f"status:{job_id}", "queued", ex=STATUS_TTL_SECONDS)
-    await r.lpush(QUEUE_KEY, json.dumps(job))
+    # MULTI/EXEC: Redis applies both commands or neither
+    async with r.pipeline(transaction=True) as pipe:
+        await (
+            pipe.set(f"status:{job_id}", "queued", ex=STATUS_TTL_SECONDS)
+            .lpush(QUEUE_KEY, json.dumps(job))
+            .execute()
+        )
     return {"job_id": job_id}
 
 
@@ -41,7 +53,11 @@ async def generate(req: GenerateRequest):
 async def result(job_id: str):
     raw = await r.get(f"result:{job_id}")
     if raw is not None:
-        return {"job_id": job_id, "status": "done", "result": json.loads(raw)}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="stored result is not valid JSON")
+        return {"job_id": job_id, "status": "done", "result": parsed}
     status = await r.get(f"status:{job_id}")
     if status is not None:
         return {"job_id": job_id, "status": status}
@@ -55,8 +71,5 @@ async def queue():
 
 @app.get("/health")
 async def health():
-    try:
-        await r.ping()
-    except redis.ConnectionError:
-        return JSONResponse(status_code=503, content={"status": "redis unavailable"})
+    await r.ping()  # if Redis is down, redis_unavailable() returns 503
     return {"status": "ok"}
