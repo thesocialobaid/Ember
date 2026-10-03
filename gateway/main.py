@@ -2,6 +2,7 @@ import json
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException
@@ -9,11 +10,26 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-QUEUE_KEY = "inference_queue"
+STREAM_KEY = "jobs"
+GROUP = "workers"
 STATUS_TTL_SECONDS = 3600
 
 r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1, socket_connect_timeout=1)
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # "0": the group sees every entry already in the stream, so none are skipped.
+    # MKSTREAM: create the stream if it doesn't exist yet.
+    try:
+        await r.xgroup_create(STREAM_KEY, GROUP, id="0", mkstream=True)
+    except redis.ResponseError as e:
+        if "BUSYGROUP" not in str(e):  # BUSYGROUP: the worker already created it
+            raise
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(redis.ConnectionError)
@@ -39,11 +55,12 @@ async def generate(req: GenerateRequest):
         "model": req.model,
         "enqueued_at": time.time(),
     }
-    # MULTI/EXEC: Redis applies both commands or neither
+    # MULTI/EXEC: Redis applies both commands or neither.
+    # No MAXLEN: trimming by count could delete jobs that were never acked.
     async with r.pipeline(transaction=True) as pipe:
         await (
             pipe.set(f"status:{job_id}", "queued", ex=STATUS_TTL_SECONDS)
-            .lpush(QUEUE_KEY, json.dumps(job))
+            .xadd(STREAM_KEY, job)
             .execute()
         )
     return {"job_id": job_id}
@@ -52,13 +69,15 @@ async def generate(req: GenerateRequest):
 @app.get("/v1/result/{job_id}")
 async def result(job_id: str):
     raw = await r.get(f"result:{job_id}")
+    status = await r.get(f"status:{job_id}")
     if raw is not None:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail="stored result is not valid JSON")
-        return {"job_id": job_id, "status": "done", "result": parsed}
-    status = await r.get(f"status:{job_id}")
+        # A result exists for both "done" and "failed" (dead-lettered) jobs;
+        # it carries "attempts" either way.
+        return {"job_id": job_id, "status": status or "done", "result": parsed}
     if status is not None:
         return {"job_id": job_id, "status": status}
     raise HTTPException(status_code=404, detail="job not found")
@@ -66,7 +85,17 @@ async def result(job_id: str):
 
 @app.get("/v1/queue")
 async def queue():
-    return {"queue": QUEUE_KEY, "length": await r.llen(QUEUE_KEY)}
+    # length counts every entry ever added (acked ones stay until trimmed);
+    # pending counts entries delivered to a worker but not yet acked.
+    length = await r.xlen(STREAM_KEY)
+    pending = await r.xpending(STREAM_KEY, GROUP)
+    return {"stream": STREAM_KEY, "length": length, "pending": pending["pending"]}
+
+
+@app.get("/v1/metrics")
+async def metrics():
+    # Incremented by workers when XACK returns 0 (another worker already finished the job).
+    return {"duplicates": int(await r.get("metrics:duplicates") or 0)}
 
 
 @app.get("/health")

@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -43,6 +43,12 @@ async def health():
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest):
+    # Failure injection: a marker in the prompt forces an error.
+    if "POISON" in req.prompt:
+        raise HTTPException(status_code=500, detail="injected server error (POISON)")
+    if "BADREQUEST" in req.prompt:
+        raise HTTPException(status_code=400, detail="injected bad request (BADREQUEST)")
+
     completion_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     prompt_tokens = len(req.prompt.split())
