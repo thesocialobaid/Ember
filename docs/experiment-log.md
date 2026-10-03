@@ -107,7 +107,8 @@ poll returned `status: done` without a `result`.
 second copy. The original always finished first and won; the copy's `SET NX` and `done` write
 were refused and its `XACK` returned 0, which is the counted duplicate. The checker crash is
 an old gateway race: `/v1/result` reads `result:` and `status:` in two separate GETs, so a job
-finishing between them looks done with no result.
+finishing between them looks done with no result. Fixed afterwards: `/v1/result` now reads
+both keys with one `MGET`.
 
 ---
 
@@ -154,24 +155,55 @@ Service workers stopped; a one-off `CRASH_AFTER_POP=1` worker takes the burst; o
 
 **Observation.** LOST = 0 with the production timeouts. This time all 4 consumer loops were
 holding a job when the worker died, so 4 were rescued, unlike M2-2 (1). The rescued jobs set the
-p95: about 80 s, roughly claim idle (75 s) plus one job. The 14 retried 503s are not explained
-yet: Redis was not restarted during this run.
+p95: about 80 s, roughly claim idle (75 s) plus one job. The 14 retried 503s: see the note below.
 
 **Why.** The burst sends 50 jobs concurrently, so all 4 blocked loops received a job before
 the first one's `SIGKILL` landed. Each rescued job waits for its idle time to pass 75 s before
 `XAUTOCLAIM` can take it, so a crash costs those jobs about 75 s of latency but no loss.
 
+**503 note (investigated later the same day).** The 503s were not caused by `--crash`: a rerun
+had 0, and so did a plain burst. Redis had been recreated at 18:11 (switch to the named volume)
+while the gateway kept running since 17:54. Both runs with 503s (29, then 14) came right after
+that; every run since had 0. Most likely explanation: the gateway's redis-py connection pool
+still held connections to the old Redis container, each failed once (503) and was replaced.
+Inferred from timing, not proven.
+
 ---
 
-## M2-7: Redis hard kill, without and with AOF
+## M2-7: Redis hard kill, without and with AOF (2026-10-03)
 
-TODO (me): run the experiment and paste the burst summaries and XLEN/XPENDING here.
+**Setup.** For each run: `docker compose down -v` (fresh volume), `REDIS_AOF=no|yes`,
+`docker compose up -d --build --scale worker=2`, then a 50-job burst (`--timeout 120`).
+5 s into the burst: `docker compose kill -s SIGKILL redis`, `docker compose start redis`,
+then `docker compose up -d --scale worker=2 worker` to restart the workers. AOF run uses
+`appendfsync everysec`. Default `CLAIM_IDLE_MS` (75 s).
 
 | | Without AOF | With AOF (`everysec`) |
 |---|---|---|
-| Sent | | |
-| Done | | |
-| Failed | | |
-| LOST | | |
-| 503s retried | | |
-| XLEN / XPENDING after | | |
+| Before kill: XLEN / pending / status keys | 42 / 8 / 50 | 42 / 8 / 50 |
+| After Redis restart: XLEN | **0** | **34** |
+| After Redis restart: consumer group | gone (`ERR no such key`) | `workers` intact |
+| After Redis restart: status keys | **0** | **50** |
+| Workers when Redis came back | both exited (1), `ConnectionError` | both exited (1), `ConnectionError` |
+| Sent / done / failed / LOST | 50 / 16 / 0 / **34** | 50 / 50 / 0 / **0** |
+| 503s retried by burst.py | 86 | 86 |
+| End-to-end p50 / p95 / max | 3.45 / 5.99 / 5.99 s (done jobs only) | 20.65 / 84.61 / 84.61 s |
+| Final XLEN / XPENDING | 0 / 0 | 0 / 0 |
+
+**Observation.** Without AOF, Redis came back empty: the stream, the group and every status key
+were gone, and 34 jobs (8 in flight plus 26 waiting) were lost; only the 16 that finished
+before the kill survived. With AOF, everything came back and LOST = 0. In both runs the workers
+crashed on the Redis `ConnectionError` and had to be restarted by hand. In the AOF run, p95 was
+about 85 s: the jobs the dead workers held waited for the 75 s claim idle.
+
+**Why.** Without AOF, Redis only has its default RDB snapshots (save rules of 60 s or more),
+and none had been taken in the few seconds before the kill. With AOF every write is appended to
+a file and replayed on start. A SIGKILL of the Redis process doesn't lose the last second
+either: the bytes Redis already wrote sit in the OS page cache, so `everysec` only matters if the
+whole machine dies. The workers crash because `consume()` and `reclaim()` only catch
+`redis.TimeoutError`, not `ConnectionError`. Not fixed yet.
+
+**Follow-up checks on the same stack.** The first burst after the AOF run failed with
+`httpx.RemoteProtocolError: Server disconnected without sending a response`, while the gateway
+container never restarted. Two more bursts right after were clean (0 503s, LOST 0). Not
+reproduced; cause unknown.

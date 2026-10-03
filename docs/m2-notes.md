@@ -70,7 +70,8 @@ Each step was one concept, explained before coding, then checked with a measurem
 7. **Graceful shutdown.** SIGTERM drains in-flight jobs; `stop_grace_period: 90s`. Stop vs
    kill (M2-5).
 8. **Durable Redis.** AOF with `appendfsync everysec` on a named volume; `burst.py` retries
-   503s with backoff. Experiment M2-7 still to run.
+   503s with backoff. Redis hard kill (M2-7): without AOF, 34 of 50 LOST and the group was
+   gone; with AOF, LOST = 0.
 9. **Load test reporting.** `burst.py` reports failure reasons and duplicates, and `--crash`
    automates the crash test.
 
@@ -78,7 +79,12 @@ Surprises along the way:
 - The mock model's timing wasn't what I assumed; always read the code before deriving.
 - The log line "not moved back to running" was misleading: the script also refuses
   `running → running`, so most refusals were no-ops, not real backward moves.
-- `/v1/result` reads result and status in two GETs, so it can briefly say `done` with no result.
+- `/v1/result` read result and status in two GETs, so it could briefly say `done` with no
+  result. Fixed with one `MGET`, which sees both keys from the same moment.
+- Workers crash when Redis drops the connection (`ConnectionError` isn't caught). In M2-7 both
+  had to be restarted by hand. Still open.
+- 503s after Redis was recreated under a running gateway: most likely stale pooled connections,
+  each failing once. Inferred from timing.
 - My first stop-vs-kill check counted 1 pending job for the stopped worker. It was really 0:
   `redis-cli` prints a blank line for an empty list, and `wc -l` counted it.
 

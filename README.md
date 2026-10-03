@@ -361,7 +361,7 @@ ember/
 ## Roadmap
 
 - [x] **M1. Async core:** gateway + Redis Streams + worker + mock model (Docker Compose)
-- [ ] **M2. Reliability:** ack, retry, dead-letter queue, AOF persistence, failure-injection tests
+- [x] **M2. Reliability:** ack, retry, dead-letter queue, AOF persistence, failure-injection tests
 - [ ] **M3. Streaming:** SSE endpoint with resumable reconnects
 - [ ] **M4. Kubernetes + KEDA:** local k3d, scale workers 0 → N
 - [ ] **M5. GPU + vLLM on GKE:** real model, Cluster Autoscaler, baseline measurements

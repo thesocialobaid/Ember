@@ -68,8 +68,10 @@ async def generate(req: GenerateRequest):
 
 @app.get("/v1/result/{job_id}")
 async def result(job_id: str):
-    raw = await r.get(f"result:{job_id}")
-    status = await r.get(f"status:{job_id}")
+    # One MGET, not two GETs: the worker writes result and status in one MULTI,
+    # and a single command sees both from the same moment. Two GETs could
+    # straddle that MULTI and report "done" with no result.
+    raw, status = await r.mget(f"result:{job_id}", f"status:{job_id}")
     if raw is not None:
         try:
             parsed = json.loads(raw)
