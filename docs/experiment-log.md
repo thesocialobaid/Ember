@@ -207,3 +207,137 @@ whole machine dies. The workers crash because `consume()` and `reclaim()` only c
 `httpx.RemoteProtocolError: Server disconnected without sending a response`, while the gateway
 container never restarted. Two more bursts right after were clean (0 503s, LOST 0). Not
 reproduced; cause unknown.
+
+---
+
+## M3-1: time to first token, polling vs SSE (2026-10-04)
+
+**Setup.** Idle system, 2 workers. Polling: `burst.py -n 1` (32 tokens, polls every 0.5 s), 5
+runs. SSE: `loadtest/sse_check.py --max-tokens 32`, 5 runs. Both measured by the client from
+just before `POST /v1/generate`.
+
+| | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |
+|---|---|---|---|---|---|
+| Polling: first text visible (= end-to-end) | 3.19 s | 3.13 s | 3.21 s | 3.19 s | 3.20 s |
+| SSE: first token (client) | 2.103 s | 2.086 s | 2.098 s | 2.091 s | 2.075 s |
+| SSE: last token (client) | 2.752 s | 2.729 s | 2.745 s | 2.744 s | 2.739 s |
+| SSE: `ttft_s` (worker, from `enqueued_at`) | 2.029 s | 2.023 s | 2.029 s | 2.029 s | 2.027 s |
+
+**Observation.** With SSE the first token arrives about 1.1 s sooner than polling shows any
+text, and even the last SSE token (about 2.74 s) arrives before polling shows anything. The
+client sees the first token 50 to 75 ms after the worker records it.
+
+**Why.** Polling shows nothing until the whole answer is written, and then adds up to 0.5 s of
+polling delay. SSE shows the first token right after prefill (2 s in the mock). The 50 to 75 ms
+gap is XADD, then the gateway's XREAD waking up, then the HTTP chunk.
+
+Same session, regression check: a 30-job polling burst with the streaming worker gave
+sent 30, done 30, LOST 0, duplicates 0, end-to-end p50 5.74 s, p95 11.38 s.
+
+---
+
+## M3-2: resume after a dropped connection (2026-10-04)
+
+**Setup.** `sse_check.py --max-tokens 100 --drop-after 8`: close the connection after 8 token
+events, reconnect with `Last-Event-ID` set to the 8th token's entry ID.
+
+| Metric | Value |
+|---|---|
+| Connections | 2 |
+| Token events | 100 |
+| Repeats (IDs not increasing) | 0 |
+| Tokens since last reset vs `done.completion_tokens` | 100 vs 100 |
+| Text == `/v1/result` response | yes (466 chars) |
+| Token 8 / token 9 arrival (across the reconnect) | 2.224 s / 2.247 s |
+| Client TTFT / last token | 2.097 s / 4.185 s |
+
+**Observation.** No gaps, no repeats. The reconnect cost about the same as one token interval
+(23 ms between tokens 8 and 9, vs about 21 ms normally).
+
+**Why.** The SSE `id:` is the Redis entry ID, and `XREAD ... STREAMS tokens:{id} <last-id>`
+returns only entries strictly after it. Tokens produced while the client was away were already
+stored in the stream, so the second connection's first XREAD returned them at once.
+
+---
+
+## M3-3: worker killed mid-stream (2026-10-04)
+
+**Setup.** Workers stopped. One worker with `CRASH_MID_STREAM=20 CLAIM_IDLE_MS=8000`, which
+SIGKILLs itself after XADDing 20 tokens. `sse_check.py --max-tokens 50` connected for the whole
+run. After the crash (exit code 137), a healthy worker with `CLAIM_IDLE_MS=8000` started.
+
+| Metric | Value |
+|---|---|
+| `XRANGE tokens:<id>` | 20 tokens (attempt 1), 1 reset (attempt 2), 50 tokens (attempt 2), 1 done (attempt 2) |
+| Client events | 20 tokens, `status: running`, reset (discarding 20 tokens, 94 chars), 50 tokens, done |
+| Connections / repeats | 1 / 0 |
+| Text == `/v1/result` response | yes (236 chars), `attempts: 2` |
+| Client first token (attempt 1) | 2.120 s |
+| Last attempt-1 token, first attempt-2 token | 2.500 s, 10.936 s |
+| Result `queue_wait_s` / `ttft_s` / `total_s` | 8.803 / 10.857 / 11.909 s |
+
+**Observation.** The old tokens stay in the stream; the reset sits between the two attempts.
+The client cleared its text on reset and ended with exactly the stored result. The user saw
+about 8.4 s of nothing between the two attempts.
+
+**Why.** The reclaiming worker's XPENDING delivery count was 2, so `stream_completion` wrote a
+reset before streaming. The gap is `CLAIM_IDLE_MS` (8 s) plus up to one `RECLAIM_EVERY_S`
+(2 s) plus prefill (2 s), counted from the crash delivery.
+
+---
+
+## M3-4: late joiner and unknown job (2026-10-04)
+
+**Setup.** (a) After M3-3 finished, `DEL tokens:<id>`, then `sse_check.py --job-id <id>`.
+(b) `curl -i /v1/stream/doesnotexist`.
+
+| Case | Result |
+|---|---|
+| (a) Late joiner, token stream deleted | one `done` event with `fallback: true` and the stored result; text == result; PASS |
+| (b) Unknown job ID | `HTTP/1.1 404 Not Found`, `{"detail":"job not found"}`, before any stream opened |
+
+**Observation.** Both behaved as designed. The fallback `done` has no `id:` (there is no stream
+entry for it) and arrived after the first 2 s XREAD block, not immediately.
+
+---
+
+## M3-5: 60 simultaneous streams, Redis connections (2026-10-04)
+
+**Setup.** 2 workers (8 consumer loops). 60 jobs of 10 tokens.
+Run 1: 60 separate `sse_check.py` processes started from a shell loop.
+Run 2: one asyncio script (scratch, not in the repo) that POSTs 60 jobs and opens 60 streams at
+once, after a gateway restart so its connection pools start empty. `connected_clients` from
+`INFO clients`; per-gateway count from `CLIENT LIST` filtered by the gateway's IP.
+
+| | Run 1 (60 processes) | Run 2 (one process, after gateway restart) |
+|---|---|---|
+| `connected_clients` before (from gateway) | 15 (4) | 12 (1) |
+| Peak `connected_clients` (from gateway) | 50 (39) | 131 (120) |
+| Right after all streams ended | 50 (39) | 131 (120) |
+| 30 s later | 50 (39) | 131 (120) |
+| Streams correct | 60/60 PASS | 60/60 |
+| Client TTFT p50 / p95 / max | 5.47 / 9.14 / 9.29 s | 9.18 / 17.87 / 18.02 s |
+
+Run 2, gateway connections by last command: 59 `xread`, 59 `exec`, 2 `mget`.
+
+**Observation.** In run 2 the gateway held 120 Redis connections for 60 streams, and none were
+closed 30 s after the streams ended. Run 1 peaked lower (39) because starting 60 Python
+processes on Windows staggered the clients, so fewer streams were open at once. TTFT is mostly
+queue wait: 60 jobs on 8 consumer loops.
+
+**Why.** Each open stream holds one connection from the SSE client's pool while XREAD blocks
+(the 59 `xread`). The other ~60 are most likely the main client's pool, opened by the 60
+concurrent `POST /v1/generate` MULTIs (last command `exec`); this split is inferred from the
+last command, not proven. redis-py keeps idle pooled connections open, so the count stays at
+its peak until the gateway restarts.
+
+---
+
+## M3: what surprised us (2026-10-04)
+
+- The connection count doubled (two pools) and never came back down.
+- In M3-3, the result's `ttft_s` is 10.857 s, but the user saw a first token at 2.12 s. The
+  stored metric describes the attempt that succeeded, not what the user experienced.
+- In M3-3 the client got `status: running` only after the crash: before that, every XREAD
+  returned tokens, so the loop was never idle and never checked status.
+- A queued job's first `status` event comes after one 2 s XREAD block, not on connect.

@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from sse import router as sse_router
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAM_KEY = "jobs"
 GROUP = "workers"
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(sse_router)  # GET /v1/stream/{job_id}
 
 
 @app.exception_handler(redis.ConnectionError)

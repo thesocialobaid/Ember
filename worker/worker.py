@@ -8,6 +8,8 @@ import time
 import httpx
 import redis.asyncio as redis
 
+from streaming import TOKEN_STREAM_TTL_S, stream_completion
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 MODEL_URL = os.getenv("MODEL_URL", "http://localhost:8001")
 CONCURRENCY = int(os.getenv("CONCURRENCY", "4"))
@@ -141,40 +143,42 @@ async def process(
             log.info("%s status of %s left as is (already running or finished)", name, job_id)
 
         started = time.perf_counter()
-        # Stream fields come back as strings, so numbers are converted here.
-        resp = await http.post(
-            f"{MODEL_URL}/v1/completions",
-            json={
-                "model": job["model"],
-                "prompt": job["prompt"],
-                "max_tokens": int(job["max_tokens"]),
-                "stream": False,
-            },
-        )
-        resp.raise_for_status()
+        # Every token goes to tokens:{job_id} as it arrives. The attempt number
+        # is Redis' delivery count: 1 from consume(), XPENDING's from reclaim().
+        streamed = await stream_completion(r, http, MODEL_URL, job, attempts)
         inference_s = time.perf_counter() - started
 
-        body = resp.json()
         enqueued_at = float(job["enqueued_at"])
         done_at = time.time()
         result = {
-            "response": body["choices"][0]["text"],
-            "completion_tokens": body["usage"]["completion_tokens"],
+            "response": streamed["text"],
+            "completion_tokens": streamed["completion_tokens"],
             "queue_wait_s": round(picked_at - enqueued_at, 3),
+            "ttft_s": streamed["ttft_s"],
             "inference_s": round(inference_s, 3),
             "total_s": round(done_at - enqueued_at, 3),
             "worker": name,
             "attempts": attempts,
         }
+        done_entry = {
+            "type": "done",
+            "attempt": attempts,
+            "completion_tokens": streamed["completion_tokens"],
+            "ttft_s": streamed["ttft_s"],
+        }
         # Ack only after the result is written; XDEL after XACK so the
-        # stream holds only unfinished jobs.
+        # stream holds only unfinished jobs. The done entry is in the same
+        # MULTI as the result: a client that reads "done" and then fetches
+        # /v1/result must find it.
         async with r.pipeline(transaction=True) as pipe:
             # NX: the first finisher's result wins; a late duplicate can't overwrite it.
             pipe.set(f"result:{job_id}", json.dumps(result), ex=RESULT_TTL_SECONDS, nx=True)
             await set_status(keys=[f"status:{job_id}"], args=["done", STATUS_TTL_SECONDS], client=pipe)
+            pipe.xadd(f"tokens:{job_id}", done_entry)
+            pipe.expire(f"tokens:{job_id}", TOKEN_STREAM_TTL_S)
             pipe.xack(STREAM_KEY, GROUP, entry_id)
             pipe.xdel(STREAM_KEY, entry_id)
-            acked = (await pipe.execute())[2]
+            acked = (await pipe.execute())[4]
         if acked == 0:
             await count_duplicate(r, job_id)
     except httpx.HTTPStatusError as exc:

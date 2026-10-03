@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py sse.py ./
 
 # 0.0.0.0, not 127.0.0.1: the container's localhost is unreachable from outside it.
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

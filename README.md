@@ -362,7 +362,7 @@ ember/
 
 - [x] **M1. Async core:** gateway + Redis Streams + worker + mock model (Docker Compose)
 - [x] **M2. Reliability:** ack, retry, dead-letter queue, AOF persistence, failure-injection tests
-- [ ] **M3. Streaming:** SSE endpoint with resumable reconnects
+- [x] **M3. Streaming:** SSE endpoint with resumable reconnects
 - [ ] **M4. Kubernetes + KEDA:** local k3d, scale workers 0 → N
 - [ ] **M5. GPU + vLLM on GKE:** real model, Cluster Autoscaler, baseline measurements
 - [ ] **M6. SLO-aware scaling:** Prometheus triggers, policy comparison, cooldown sweep
@@ -378,6 +378,8 @@ ember/
 - **Small model.** A 1.5B model keeps experiments cheap. Load-time and batching results will differ for 7B+ models.
 - **Spot preemption.** Spot nodes can be reclaimed at any time. This is used as a real failure-injection source, but it also adds variance to timings.
 - **No multi-GPU or tensor parallelism.** Every model fits on one GPU.
+- **One Redis connection per open stream.** Each `GET /v1/stream` holds a connection while its `XREAD` blocks, and redis-py keeps them pooled afterwards (60 streams left the gateway with 120 connections). Fine at this scale, not for thousands of concurrent viewers, which would need one shared reader fanning out to clients.
+- **Proxies may buffer SSE.** A reverse proxy or load balancer in front of the gateway can buffer the response and deliver tokens in bursts or only at the end. The gateway sends `X-Accel-Buffering: no` and `Cache-Control: no-cache`, but each proxy must be checked.
 
 ## Acknowledgments
 

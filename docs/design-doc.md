@@ -19,3 +19,15 @@ TODO (me)
 ## Durability tradeoff (AOF, appendfsync)
 
 TODO (me)
+
+## SSE vs polling vs WebSocket
+
+TODO (me)
+
+## Resumable streams
+
+TODO (me)
+
+## Retries mid-stream
+
+TODO (me)
